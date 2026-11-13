@@ -20,7 +20,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("=== RTC Alarm Example ===");
 
-    let mut rtc = Rtc::new(p.RTC0, Irqs, Default::default()).unwrap();
+    let (mut rtc, _time) = Rtc::new(p.RTC0, Irqs, Default::default()).unwrap();
 
     let now = DateTime {
         year: 2026,

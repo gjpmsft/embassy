@@ -1,9 +1,9 @@
 //! RTC DateTime driver.
-use core::future::Future;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_embedded_hal::SetConfig;
+use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
 #[cfg(feature = "embedded-mcu-hal")]
 use embedded_mcu_hal::time::{Datetime, DatetimeClock, DatetimeClockError, DatetimeFields, Month as HalMonth};
@@ -460,7 +460,25 @@ const _: () = {
     assert!(matches!(Weekday::from_register(7), Err(RtcError::InvalidDateTime)));
 };
 
-/// RTC driver.
+/// Read-only access to the current time, independent of alarm waits.
+///
+/// Created together with [`Rtc`]. Clones can be shared with other tasks; they
+/// cannot replace an outstanding alarm.
+#[derive(Clone)]
+pub struct RtcTimeProvider<'a> {
+    info: &'static Info,
+    _inst: PhantomData<&'a ()>,
+    _wg: Option<WakeGuard>,
+}
+
+impl RtcTimeProvider<'_> {
+    /// Return the current datetime. See [`Rtc::now`].
+    pub fn now(&self) -> Result<DateTime, RtcError> {
+        read_datetime(self.info)
+    }
+}
+
+/// Exclusive RTC configuration and alarm handle.
 pub struct Rtc<'a> {
     _inst: core::marker::PhantomData<&'a mut ()>,
     info: &'static Info,
@@ -471,12 +489,12 @@ pub struct Rtc<'a> {
 impl<'a> Rtc<'a> {
     const BASE_YEAR: i16 = 2112;
 
-    /// Create a new instance of the real time clock.
+    /// Create an exclusive RTC handle and a cloneable, read-only time provider.
     pub fn new<T: Instance>(
         _inst: Peri<'a, T>,
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
         config: Config,
-    ) -> Result<Self, SetupError> {
+    ) -> Result<(Self, RtcTimeProvider<'a>), SetupError> {
         let info = T::info();
 
         // The RTC is NOT gated by the MRCC, but the clock selected by
@@ -508,7 +526,13 @@ impl<'a> Rtc<'a> {
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
-        Ok(inst)
+        let time_provider = RtcTimeProvider {
+            info,
+            _inst: PhantomData,
+            _wg: inst._wg.clone(),
+        };
+
+        Ok((inst, time_provider))
     }
 
     fn set_configuration(&mut self, config: &Config) -> Result<(), SetupError> {
@@ -575,7 +599,7 @@ impl<'a> Rtc<'a> {
         Ok(())
     }
 
-    fn is_valid_datetime(&self, t: DateTime) -> Result<(), RtcError> {
+    fn is_valid_datetime(t: DateTime) -> Result<(), RtcError> {
         if (t.year < (Self::BASE_YEAR - 128) || t.year > (Self::BASE_YEAR + 127))
             || t.day == 0
             || t.day > 31
@@ -611,79 +635,7 @@ impl<'a> Rtc<'a> {
     /// Returns [`RtcError::Other`] if the counters do not become stable, which
     /// indicates the RTC has no running clock.
     pub fn now(&self) -> Result<DateTime, RtcError> {
-        // The four counters are separate registers, so a second boundary
-        // falling between them would splice two different instants together.
-        //
-        // Waiting and sampling are deliberately separated. Waiting out the
-        // boundary window is the only part that takes appreciable time - two
-        // oscillator cycles, ~61 us at 32.768 kHz - so it runs with interrupts
-        // enabled. Only the sample itself is masked, and that is a fixed five
-        // register reads with no loop.
-        let mut attempts = 0u32;
-        let (second, hm, d, ym) = loop {
-            attempts += 1;
-            if attempts > 8 {
-                return Err(RtcError::Other);
-            }
-
-            // RM 38.5.1.11: INVAL_BIT is asserted either side of the 1 Hz edge
-            // and a counter read taken then returns FFFFh. Spin here, unmasked.
-            // Bounded so an RTC with no running clock reports an error instead
-            // of hanging the caller.
-            let mut spins = 0u32;
-            while self.info.regs().status().read().inval_bit() {
-                spins += 1;
-                if spins > 1_000_000 {
-                    return Err(RtcError::Other);
-                }
-                core::hint::spin_loop();
-            }
-
-            // Counters are stable. Take all four under one short critical
-            // section so an interrupt cannot preempt us across a boundary,
-            // re-checking INVAL_BIT inside it because the flag can assert
-            // between the wait above and the reads actually issuing. If the
-            // boundary arrives anyway the sentinel makes it detectable, and we
-            // go back to waiting - outside the critical section.
-            let sample = critical_section::with(|_| {
-                if self.info.regs().status().read().inval_bit() {
-                    return None;
-                }
-                let second = self.info.regs().seconds().read();
-                let hm = self.info.regs().hourmin().read();
-                let d = self.info.regs().days().read();
-                let ym = self.info.regs().yearmon().read();
-
-                if second.0 == INVALID || hm.0 == INVALID || d.0 == INVALID || ym.0 == INVALID {
-                    return None;
-                }
-                Some((second.sec_cnt(), hm, d, ym))
-            });
-
-            if let Some(sample) = sample {
-                break sample;
-            }
-        };
-
-        let year = i16::from(ym.yrofst() as i8) + Self::BASE_YEAR;
-        let month = Month::from_register(ym.mon_cnt())?;
-        let dow = Weekday::from_register(d.dow())?;
-        let day = d.day_cnt();
-        let hour = hm.hour_cnt();
-        let minute = hm.min_cnt();
-
-        let datetime = DateTime {
-            year,
-            month,
-            day,
-            dow,
-            hour,
-            minute,
-            second,
-        };
-
-        self.is_valid_datetime(datetime)?;
-        Ok(datetime)
+        read_datetime(self.info)
     }
 
     /// Set the datetime to a new value.
@@ -692,7 +644,7 @@ impl<'a> Rtc<'a> {
     ///
     /// Will return `RtcError::InvalidDateTime` if the datetime is not a valid range.
     pub fn set_datetime(&mut self, t: DateTime) -> Result<(), RtcError> {
-        self.is_valid_datetime(t)?;
+        Self::is_valid_datetime(t)?;
 
         let year = (t.year - Self::BASE_YEAR) as u8;
         let month = t.month.into();
@@ -733,8 +685,8 @@ impl<'a> Rtc<'a> {
     /// `RtcError::InvalidDateTime` if the either datetime is not a valid range.
     /// `RtcError::InvalidDstYear` if the either datetime contains a future or past year.
     pub fn set_dst(&mut self, start: DateTime, end: DateTime) -> Result<(), RtcError> {
-        self.is_valid_datetime(start)?;
-        self.is_valid_datetime(end)?;
+        Self::is_valid_datetime(start)?;
+        Self::is_valid_datetime(end)?;
         self.is_valid_dst_year(start)?;
         self.is_valid_dst_year(end)?;
 
@@ -757,19 +709,18 @@ impl<'a> Rtc<'a> {
         })
     }
 
-    /// Program the RTC alarm and return a future that does not borrow the RTC.
+    /// Set alarm to `t` and wait for the RTC alarm interrupt to trigger.
     ///
-    /// This allows callers that protect the RTC with a mutex to release the
-    /// mutex before waiting for the alarm interrupt.
+    /// The RTC stays exclusively borrowed until this future completes or is
+    /// dropped, so no other caller can replace the alarm. Use [`RtcTimeProvider`]
+    /// to read the clock meanwhile. Completion or drop disarms the alarm and
+    /// clears its status.
     ///
     /// # Errors
     ///
     /// Will return `RtcError::InvalidDateTime` if the datetime is not a valid range.
-    pub fn wait_for_alarm_unlocked(
-        &mut self,
-        t: DateTime,
-    ) -> Result<impl Future<Output = Result<(), RtcError>> + 'static, RtcError> {
-        self.is_valid_datetime(t)?;
+    pub async fn wait_for_alarm(&mut self, t: DateTime) -> Result<(), RtcError> {
+        Self::is_valid_datetime(t)?;
 
         let year = (t.year - Self::BASE_YEAR) as u8;
         let month = t.month.into();
@@ -780,6 +731,15 @@ impl<'a> Rtc<'a> {
 
         let info = self.info;
         let regs = info.regs();
+
+        let _disarm = OnDrop::new(|| {
+            let _ = with_unlocked(regs, || {
+                regs.ier().modify(|w| w.set_alm_ie(false));
+                regs.isr().write(|w| w.set_alm_is(true));
+            });
+            info.alarm_fired.store(false, Ordering::Release);
+        });
+
         with_unlocked(regs, || {
             // Disarm first so the ISR cannot run on a half-written alarm.
             regs.ier().modify(|w| w.set_alm_ie(false));
@@ -817,22 +777,87 @@ impl<'a> Rtc<'a> {
             info.alarm_fired.store(true, Ordering::Release);
         }
 
-        Ok(async move {
-            info.wait_cell()
-                .wait_for(|| info.alarm_fired.swap(false, Ordering::AcqRel))
-                .await
-                .map_err(|_| RtcError::Other)
-        })
+        info.wait_cell()
+            .wait_for(|| info.alarm_fired.swap(false, Ordering::AcqRel))
+            .await
+            .map_err(|_| RtcError::Other)
     }
+}
 
-    /// Set alarm to `t` and wait for the RTC alarm interrupt to trigger.
-    ///
-    /// # Errors
-    ///
-    /// Will return `RtcError::InvalidDateTime` if the datetime is not a valid range.
-    pub async fn wait_for_alarm(&mut self, t: DateTime) -> Result<(), RtcError> {
-        self.wait_for_alarm_unlocked(t)?.await
-    }
+fn read_datetime(info: &Info) -> Result<DateTime, RtcError> {
+    // The four counters are separate registers, so a second boundary
+    // falling between them would splice two different instants together.
+    //
+    // Waiting and sampling are deliberately separated. Waiting out the
+    // boundary window is the only part that takes appreciable time - two
+    // oscillator cycles, ~61 us at 32.768 kHz - so it runs with interrupts
+    // enabled. Only the sample itself is masked, and that is a fixed five
+    // register reads with no loop.
+    let mut attempts = 0u32;
+    let (second, hm, d, ym) = loop {
+        attempts += 1;
+        if attempts > 8 {
+            return Err(RtcError::Other);
+        }
+
+        // RM 38.5.1.11: INVAL_BIT is asserted either side of the 1 Hz edge
+        // and a counter read taken then returns FFFFh. Spin here, unmasked.
+        // Bounded so an RTC with no running clock reports an error instead
+        // of hanging the caller.
+        let mut spins = 0u32;
+        while info.regs().status().read().inval_bit() {
+            spins += 1;
+            if spins > 1_000_000 {
+                return Err(RtcError::Other);
+            }
+            core::hint::spin_loop();
+        }
+
+        // Counters are stable. Take all four under one short critical
+        // section so an interrupt cannot preempt us across a boundary,
+        // re-checking INVAL_BIT inside it because the flag can assert
+        // between the wait above and the reads actually issuing. If the
+        // boundary arrives anyway the sentinel makes it detectable, and we
+        // go back to waiting - outside the critical section.
+        let sample = critical_section::with(|_| {
+            if info.regs().status().read().inval_bit() {
+                return None;
+            }
+            let second = info.regs().seconds().read();
+            let hm = info.regs().hourmin().read();
+            let d = info.regs().days().read();
+            let ym = info.regs().yearmon().read();
+
+            if second.0 == INVALID || hm.0 == INVALID || d.0 == INVALID || ym.0 == INVALID {
+                return None;
+            }
+            Some((second.sec_cnt(), hm, d, ym))
+        });
+
+        if let Some(sample) = sample {
+            break sample;
+        }
+    };
+
+    let year = i16::from(ym.yrofst() as i8) + Rtc::BASE_YEAR;
+    let month = Month::from_register(ym.mon_cnt())?;
+    let dow = Weekday::from_register(d.dow())?;
+    let day = d.day_cnt();
+    let hour = hm.hour_cnt();
+    let minute = hm.min_cnt();
+
+    let datetime = DateTime {
+        year,
+        month,
+        day,
+        dow,
+        hour,
+        minute,
+        second,
+    };
+
+    Rtc::is_valid_datetime(datetime)?;
+    Ok(datetime)
 }
 
 /// RTC interrupt handler
@@ -844,19 +869,26 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
 
         let regs = T::info().regs();
 
-        // Check if this is actually a time alarm interrupt. Reject the FFFEh
-        // synchronizing sentinel first: ALM_IS is bit 2, which is set in FFFEh.
-        let status = regs.isr().read();
-
-        if status.0 != DESYNCED && status.alm_is() && regs.ier().read().alm_ie() {
-            // Acknowledge and disarm here, inside a fresh unlock window, so no
-            // later code has to write to a block that may have locked itself.
-            // On failure ALM_IS stays set and the interrupt re-enters to retry.
+        // Read and acknowledge under one critical section, so a re-arm cannot
+        // land between the status read and the acknowledge.
+        let fired = critical_section::with(|_| {
+            // Reject the FFFEh synchronizing sentinel first: ALM_IS is bit 2,
+            // which is set in FFFEh.
+            let status = regs.isr().read();
+            if status.0 == DESYNCED || !status.alm_is() || !regs.ier().read().alm_ie() {
+                return false;
+            }
+            // Acknowledge and disarm inside a fresh unlock window, so no later
+            // code has to write to a block that may have locked itself. On
+            // failure ALM_IS stays set and the interrupt re-enters to retry.
             let _ = with_unlocked(regs, || {
                 regs.isr().write(|w| w.set_alm_is(true));
                 regs.ier().modify(|w| w.set_alm_ie(false));
             });
             T::info().alarm_fired.store(true, Ordering::Release);
+            true
+        });
+        if fired {
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
         }

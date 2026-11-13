@@ -66,6 +66,7 @@ use core::marker::PhantomData;
 
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
+use embassy_time::{Duration, Instant};
 
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -119,7 +120,16 @@ pub enum IOError {
     InvalidReadBufferLength,
     /// Other internal errors or unexpected state.
     Other,
+    /// A blocking wait did not finish in time, for example because SCL or
+    /// SDA is held low. The stuck command was aborted.
+    Timeout,
 }
+
+/// Longest a blocking wait may spin before the bus is treated as stuck.
+///
+/// Above the SMBus clock-stretch limit (tTIMEOUT, 35 ms max) so that a slow
+/// but working target is not cut off.
+const BLOCKING_TIMEOUT: Duration = Duration::from_millis(50);
 
 impl From<crate::dma::InvalidParameters> for IOError {
     fn from(_value: crate::dma::InvalidParameters) -> Self {
@@ -809,6 +819,32 @@ impl<'d, M: Mode> I2c<'d, M> {
         });
     }
 
+    /// Spin until `done` returns true, or abort the stuck command after
+    /// [`BLOCKING_TIMEOUT`].
+    ///
+    /// Without a bound, a target holding SCL low keeps every wait below
+    /// spinning forever. That includes `remediation`, which runs from `Drop`
+    /// when a caller times out an async transfer, so the executor would hang.
+    fn wait_until(&self, mut done: impl FnMut() -> bool) -> Result<(), IOError> {
+        let deadline = Instant::now() + BLOCKING_TIMEOUT;
+        while !done() {
+            if Instant::now() >= deadline {
+                self.abort_stuck_command();
+                return Err(IOError::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// Terminate the current command and clear all state. The RM names a
+    /// write of 0 to MCR[MEN] as the clean way to end a stuck command.
+    fn abort_stuck_command(&self) {
+        critical_section::with(|_| self.info.regs().mcr().modify(|w| w.set_men(false)));
+        self.recover_from_error();
+        critical_section::with(|_| self.info.regs().mcr().modify(|w| w.set_men(true)));
+    }
+
     /// Recover from an I2C error by resetting FIFOs and clearing all
     /// status flags.  Without this, a NACK or FIFO error leaves the
     /// LPI2C controller in a state where every subsequent transaction
@@ -902,9 +938,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Keep NDF asserted until STOP completes. Clearing NDF early can
             // release the rejected command still held by the command engine,
             // causing its data byte to become the address of the next packet.
-            while !self.is_stop_complete_or_error() {
-                core::hint::spin_loop();
-            }
+            self.wait_until(|| self.is_stop_complete_or_error())?;
 
             let recovery_status = self.info.regs().msr().read();
             let recovery_result = match self.parse_status(&recovery_status) {
@@ -963,13 +997,13 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
 
         // Wait until we have space in the TxFIFO
-        while self.is_tx_fifo_full() {}
+        self.wait_until(|| !self.is_tx_fifo_full())?;
 
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(if self.is_hs { Cmd::START_HS } else { Cmd::START }, addr_rw);
 
         // Wait for TxFIFO to be drained
-        while !self.is_tx_fifo_empty_or_error() {}
+        self.wait_until(|| self.is_tx_fifo_empty_or_error())?;
 
         // Check controller status
         self.status_and_act()
@@ -983,13 +1017,13 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// sent.
     fn stop(&self) -> Result<(), IOError> {
         // Wait until we have space in the TxFIFO
-        while self.is_tx_fifo_full() {}
+        self.wait_until(|| !self.is_tx_fifo_full())?;
 
         self.send_cmd(Cmd::STOP, 0);
 
         // Wait until STOP is observed on the bus. FIFO empty only means the
         // command was accepted by the controller, not that it completed.
-        while !self.is_stop_complete_or_error() {}
+        self.wait_until(|| self.is_stop_complete_or_error())?;
 
         self.status_and_act()
     }
@@ -1003,13 +1037,13 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.start(address, true)?;
 
             // Wait until we have space in the TxFIFO
-            while self.is_tx_fifo_full() {}
+            self.wait_until(|| !self.is_tx_fifo_full())?;
 
             self.send_cmd(Cmd::RECEIVE, (chunk.len() - 1) as u8);
 
             for byte in chunk.iter_mut() {
                 // Wait until there's data in the RxFIFO
-                while self.is_rx_fifo_empty() {}
+                self.wait_until(|| !self.is_rx_fifo_empty())?;
 
                 *byte = self.info.regs().mrdr().read().data();
             }
@@ -1046,7 +1080,7 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         for byte in write {
             // Wait until we have space in the TxFIFO
-            while self.is_tx_fifo_full() {}
+            self.wait_until(|| !self.is_tx_fifo_full())?;
 
             self.send_cmd(Cmd::TRANSMIT, *byte);
         }

@@ -1204,7 +1204,10 @@ where
     fn enable_stop_ints(&self) {
         self.info.regs().mier().write(|w| {
             w.set_sdie(true);
-            w.set_ndie(true);
+            // No NDIE: the STOP wait ignores NDF on purpose (it is handled
+            // after STOP completes), so its interrupt would wake and re-arm
+            // this wait forever while NDF stays latched.
+            w.set_ndie(false);
             w.set_alie(true);
             w.set_feie(true);
             w.set_pltie(true);
@@ -1451,11 +1454,19 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     .wait_for(|| {
                         // enable interrupts
                         self.enable_rx_ints();
-                        // if the rx FIFO is not empty, we need to read a byte
-                        !self.is_rx_fifo_empty()
+                        // if the rx FIFO is not empty, we need to read a byte.
+                        // Enabled errors (ALF, NDF, FEF, PLTF) stay latched, so
+                        // they must end the wait too, or it spins re-arming them.
+                        !self.is_rx_fifo_empty() || self.status().is_err()
                     })
                     .await
                     .map_err(|_| IOError::ReadFail)?;
+
+                if self.is_rx_fifo_empty() {
+                    // Error exit; dropping `on_drop` runs the recovery.
+                    self.status()?;
+                    return Err(IOError::ReadFail);
+                }
 
                 *byte = self.info.regs().mrdr().read().data();
             }
@@ -1615,9 +1626,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // own remediation; if we set OnDrop earlier, the early `?`
         // return would invoke remediation a second time and corrupt
         // the controller state for the next transaction.
+        // Quiesce DMA before remediation: the caller's buffer is released
+        // when this future is dropped, so no DMA write may still be pending.
         let on_drop = OnDrop::new(|| {
-            self.remediation();
             self.info.regs().mder().modify(|w| w.set_rdde(false));
+            let _ = self.info.regs().mder().read();
+            self.mode.rx_dma.stop_after_peripheral_disable();
+            self.remediation();
         });
 
         // Drain the *entire* read with a single continuous DMA transfer
@@ -1683,10 +1698,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         cortex_m::asm::dsb();
 
         self.info.regs().mder().modify(|w| w.set_rdde(false));
-        unsafe {
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-        }
+        let _ = self.info.regs().mder().read();
+        self.mode.rx_dma.stop_after_peripheral_disable();
 
         result?;
 
@@ -1726,7 +1739,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // command FIFO after the FIFO reset.
         let on_drop = OnDrop::new(|| {
             self.info.regs().mder().modify(|w| w.set_tdde(false));
-            self.mode.tx_dma.stop();
+            let _ = self.info.regs().mder().read();
+            self.mode.tx_dma.stop_after_peripheral_disable();
             self.remediation();
         });
 
@@ -1789,7 +1803,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             cortex_m::asm::dsb();
             // Cleanup
             self.info.regs().mder().modify(|w| w.set_tdde(false));
-            self.mode.tx_dma.stop();
+            let _ = self.info.regs().mder().read();
+            self.mode.tx_dma.stop_after_peripheral_disable();
 
             if let Err(error) = result {
                 self.remediation();

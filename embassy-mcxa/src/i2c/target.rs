@@ -82,7 +82,7 @@ use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
-use crate::pac::lpi2c::{Addrcfg, Filtdz, ScrRrf, ScrRtf};
+use crate::pac::lpi2c::{Addrcfg, Filtdz, ScrRrf, ScrRtf, Ssr};
 
 /// Errors exclusive to hardware Initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -460,6 +460,22 @@ impl<'d, M: Mode> I2c<'d, M> {
         });
     }
 
+    /// Consume a latched bit or FIFO error seen by a wait predicate.
+    ///
+    /// Clears the status and FIFOs so the next transfer starts clean.
+    fn take_latched_error(&self, ssr: Ssr) -> Result<(), IOError> {
+        let error = if ssr.bef() {
+            IOError::BitError
+        } else if ssr.fef() {
+            IOError::FifoError
+        } else {
+            return Ok(());
+        };
+        self.clear_status();
+        self.reset_fifos();
+        Err(error)
+    }
+
     fn clear_status(&self) {
         self.info.regs().ssr().write(|w| {
             w.set_rsf(true);
@@ -832,6 +848,15 @@ impl<'d> I2c<'d, Dma<'d>> {
             self.mode.rx_dma.enable_request();
         }
 
+        // Runs on cancellation and on normal completion (dropped below). The
+        // caller's buffer is released when this future ends, so the DMA must
+        // be drained, not only masked.
+        let quiesce = OnDrop::new(|| {
+            self.info.regs().sder().modify(|w| w.set_rdde(false));
+            let _ = self.info.regs().sder().read();
+            self.mode.rx_dma.stop_after_peripheral_disable();
+        });
+
         // Wait for any of:
         //  - I2C end-of-transfer flag (sdf, rsf) -> controller terminated
         //  - I2C error flag (fef, bef) -> bus problem
@@ -860,11 +885,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         .await;
 
         // Cleanup
-        self.info.regs().sder().modify(|w| w.set_rdde(false));
-        unsafe {
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-        }
+        drop(quiesce);
 
         // Ensure all writes by DMA are visible to the CPU
         fence(Ordering::Acquire);
@@ -933,6 +954,14 @@ impl<'d> I2c<'d, Dma<'d>> {
             self.mode.tx_dma.enable_request();
         }
 
+        // Runs on cancellation and on normal completion (dropped below), so
+        // DMA cannot read the caller's buffer after this future ends.
+        let quiesce = OnDrop::new(|| {
+            self.info.regs().sder().modify(|w| w.set_tdde(false));
+            let _ = self.info.regs().sder().read();
+            self.mode.tx_dma.stop_after_peripheral_disable();
+        });
+
         // Wait for i2c interrupt (error or end-of-transfer).
         let i2c_interrupt = self.info.wait_cell().wait_for(|| {
             self.info.regs().sier().write(|w| {
@@ -951,11 +980,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         let mut ssr = self.info.regs().ssr().read();
 
         // Cleanup
-        self.info.regs().sder().modify(|w| w.set_tdde(false));
-        unsafe {
-            self.mode.tx_dma.disable_request();
-            self.mode.tx_dma.clear_done();
-        }
+        drop(quiesce);
 
         // DMA completion only means the final byte reached the TX FIFO. TDF
         // can assert before the controller's ninth-bit NACK and STOP, so a
@@ -1014,7 +1039,9 @@ where
             w.set_feie(true);
             w.set_beie(true);
             w.set_sdie(true);
-            w.set_rsie(true);
+            // No RSIE: the listen predicate ends on AVF, not RSF. A repeated
+            // START to another target sets only RSF, which would wake and
+            // re-arm this wait forever. A repeated START to us also sets AVF.
             w.set_avie(true);
         });
     }
@@ -1060,7 +1087,10 @@ where
             .wait_for(|| {
                 self.enable_listen_ints();
                 let status = self.info.regs().ssr().read();
-                status.avf() || status.sarf() || status.gcf() || status.sdf()
+                // BEF/FEF are enabled above and stay latched until cleared, so
+                // they must end the wait. Otherwise each retry re-enables the
+                // same pending interrupt and the wait spins without returning.
+                status.avf() || status.sarf() || status.gcf() || status.sdf() || status.bef() || status.fef()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -1161,12 +1191,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                 .wait_for(|| {
                     self.enable_tx_ints();
                     let ssr = self.info.regs().ssr().read();
-                    ssr.tdf() || ssr.sdf() || ssr.rsf()
+                    ssr.tdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
                 })
                 .await
                 .map_err(|_| IOError::Other)?;
 
             let ssr = self.info.regs().ssr().read();
+            self.take_latched_error(ssr)?;
             if ssr.sdf() || ssr.rsf() {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("Early stop of Target Send routine. STOP or Repeated-start received");
@@ -1189,12 +1220,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             .wait_for(|| {
                 self.enable_tx_ints();
                 let ssr = self.info.regs().ssr().read();
-                ssr.tdf() || ssr.sdf() || ssr.rsf()
+                ssr.tdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
             })
             .await
             .map_err(|_| IOError::Other)?;
 
         let ssr = self.info.regs().ssr().read();
+        self.take_latched_error(ssr)?;
         if ssr.sdf() || ssr.rsf() {
             self.reset_fifos();
             Ok(ReadStatus::Complete(count))
@@ -1216,12 +1248,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                 .wait_for(|| {
                     self.enable_rx_ints();
                     let ssr = self.info.regs().ssr().read();
-                    ssr.rdf() || ssr.sdf() || ssr.rsf()
+                    ssr.rdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
                 })
                 .await
                 .map_err(|_| IOError::Other)?;
 
             let ssr = self.info.regs().ssr().read();
+            self.take_latched_error(ssr)?;
             if ssr.sdf() {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("Early stop of Target Receive routine. STOP received");

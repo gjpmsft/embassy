@@ -1776,6 +1776,39 @@ impl DmaChannel<'_> {
         fence(Ordering::SeqCst);
     }
 
+    /// Stop a peripheral-paced transfer after the peripheral request is off.
+    ///
+    /// RM 23.5.9.1 order: the caller first disables the request at the
+    /// peripheral and reads it back. Then MP_HRS must read 0 before ERQ is
+    /// cleared, and [`stop`](Self::stop) then clears ERQ and waits for ACTIVE.
+    /// On return the DMA can no longer touch the transfer's buffer.
+    ///
+    /// The HRS wait runs only while ERQ is set, and it ends as long as the eDMA
+    /// makes progress (as the existing ACTIVE wait in `stop` already assumes):
+    /// - With ERQ set, the eDMA services a latched request (one minor loop,
+    ///   inside the buffer the caller still owns). The peripheral request is
+    ///   off, so HRS then drops. If it did not, every service decrements CITER,
+    ///   and the non-circular transfer ends with DREQ clearing ERQ.
+    /// - With ERQ clear, no hardware request can start the channel, so the
+    ///   buffer cannot be reached and HRS does not matter.
+    ///
+    /// Only valid for non-circular, hardware-paced transfers (DREQ set, no
+    /// software START, no channel link into this channel).
+    pub(crate) fn stop_after_peripheral_disable(&self) {
+        let bit = 1u32 << self.channel();
+        let hrs = || match self.dma() {
+            0 => pac::DMA0.mp_hrs().read().0 & bit != 0,
+            #[cfg(feature = "_mcxa5xx")]
+            1 => pac::DMA1.mp_hrs().read().0 & bit != 0,
+            _ => false,
+        };
+        let t = self.tcd();
+        while t.ch_csr().read().erq() && hrs() {
+            core::hint::spin_loop();
+        }
+        self.stop();
+    }
+
     /// Return true if the current transfer has completed.
     ///
     /// Regular transfers use the hardware DONE flag. Peripheral-paced SG uses

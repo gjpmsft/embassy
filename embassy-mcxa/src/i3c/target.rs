@@ -1482,7 +1482,13 @@ impl<T: Instance> typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
                 false
             };
 
-            if rxgr_active && (dma_complete || (stop_fired && rx_has_data)) {
+            // A target error clears SDMACTRL[DMAFB] (RM: "becomes 0 when
+            // SSTATUS[ERRWARN] becomes 1"). If that hits while the grant is
+            // still empty, nothing above finalizes it, so RX DMA would stay
+            // off for good. Treat a hardware-disabled DMA as work to redo.
+            let rx_dma_off = rxgr_active && regs.sdmactrl().read().dmafb() == SdmactrlDmafb::NotUsed;
+
+            if rxgr_active && (dma_complete || (stop_fired && rx_has_data) || rx_dma_off) {
                 // SAFETY: rxdma + rxgr present, ISR context.
                 unsafe { bbq.finalize_read(info) };
             }

@@ -1,6 +1,7 @@
 //! RTC DateTime driver.
 use core::future::Future;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_embedded_hal::SetConfig;
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -34,6 +35,10 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 struct Info {
     regs: pac::rtc::Rtc,
     wait_cell: WaitCell,
+    /// Set by the ISR (or the arm path) when the alarm fires, taken by the
+    /// alarm future. The future never touches registers, so it cannot fault
+    /// on a locked block however late it is polled.
+    alarm_fired: AtomicBool,
 }
 
 impl Info {
@@ -56,6 +61,7 @@ impl SealedInstance for crate::peripherals::RTC0 {
         static INFO: Info = Info {
             regs: pac::RTC0,
             wait_cell: WaitCell::new(),
+            alarm_fired: AtomicBool::new(false),
         };
         &INFO
     }
@@ -372,6 +378,53 @@ const DESYNCED: u16 = 0xfffe;
 /// block has no clock at all and retrying will never succeed.
 const INVALID: u16 = 0xffff;
 
+/// Bound on lock/unlock sequence retries before giving up (RM 38.3.7 note 1).
+const PROTECT_ATTEMPTS: u32 = 4;
+
+/// Run `f` with the RTC registers unlocked, then lock them again.
+///
+/// The block locks itself two seconds after an unlock, and an unlock sequence
+/// run while it is already unlocked locks it instead (RM 38.3.7). So the
+/// current state is never trusted: lock first, then unlock, which always opens
+/// a fresh two-second window, and confirm `WRITE_PROT_EN` after each step.
+/// The critical section stops the ISR and thread paths from interleaving their
+/// sequences, which would otherwise leave either one writing to a locked block
+/// (transfer error, escalated to BusFault).
+fn with_unlocked<R>(regs: pac::rtc::Rtc, f: impl FnOnce() -> R) -> Result<R, RtcError> {
+    critical_section::with(|_| {
+        let mut unlocked = false;
+        for _ in 0..PROTECT_ATTEMPTS {
+            regs.status8().write_value(0x80);
+            regs.status8().write_value(0x00);
+            regs.status8().write_value(0x40);
+            regs.status8().write_value(0xC0);
+            regs.status8().write_value(0x80);
+            if !regs.status().read().write_prot_en() {
+                unlocked = true;
+                break;
+            }
+        }
+        if !unlocked {
+            return Err(RtcError::Other);
+        }
+
+        let result = f();
+
+        for _ in 0..PROTECT_ATTEMPTS {
+            regs.status8().write_value(0x80);
+            if regs.status().read().write_prot_en() {
+                break;
+            }
+        }
+        Ok(result)
+    })
+}
+
+/// Chronological sort key for a datetime.
+fn datetime_key(t: DateTime) -> (i16, u8, u8, u8, u8, u8) {
+    (t.year, t.month.into(), t.day, t.hour, t.minute, t.second)
+}
+
 /// Errors exclusive to HW initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -466,89 +519,60 @@ impl<'a> Rtc<'a> {
             return Err(SetupError::RegisterAccess);
         }
 
-        self.disable_write_protect();
+        let regs = self.info.regs();
+        with_unlocked(regs, || {
+            regs.ctrl().modify(|w| w.set_swr(Swr::Asserted));
+            regs.ctrl().modify(|w| w.set_swr(Swr::Cleared));
 
-        self.info.regs().ctrl().modify(|w| w.set_swr(Swr::Asserted));
-        self.info.regs().ctrl().modify(|w| w.set_swr(Swr::Cleared));
+            regs.ctrl().modify(|w| {
+                w.set_clkout(config.clkout.into());
+                w.set_clko_dis(config.clkout == Clkout::None);
+                w.set_clk_sel(config.clksel.into());
+                w.set_dst_en(config.daylight_savings.into());
+                w.set_alm_match(config.alarm_match.into());
 
-        self.info.regs().ctrl().modify(|w| {
-            w.set_clkout(config.clkout.into());
-            w.set_clko_dis(config.clkout == Clkout::None);
-            w.set_clk_sel(config.clksel.into());
-            w.set_dst_en(config.daylight_savings.into());
-            w.set_alm_match(config.alarm_match.into());
+                match config.compensation {
+                    Compensation::None => {
+                        w.set_comp_en(false);
+                        w.set_fineen(false);
+                    }
 
-            match config.compensation {
-                Compensation::None => {
-                    w.set_comp_en(false);
-                    w.set_fineen(false);
+                    Compensation::Coarse { .. } => {
+                        w.set_comp_en(true);
+                        w.set_fineen(false);
+                    }
+
+                    Compensation::Fine { .. } => {
+                        w.set_comp_en(false);
+                        w.set_fineen(true);
+                    }
+                }
+            });
+
+            regs.compen().write(|w| match config.compensation {
+                Compensation::None => {}
+
+                Compensation::Coarse { interval, correction } => {
+                    w.set_compen_val((interval as u16) << 8 | correction as u16);
                 }
 
-                Compensation::Coarse { .. } => {
-                    w.set_comp_en(true);
-                    w.set_fineen(false);
+                Compensation::Fine { integral, fractional } => {
+                    w.set_compen_val((integral as u16) << 8 | fractional as u16);
                 }
-
-                Compensation::Fine { .. } => {
-                    w.set_comp_en(false);
-                    w.set_fineen(true);
-                }
-            }
-        });
-
-        self.info.regs().compen().write(|w| match config.compensation {
-            Compensation::None => {}
-
-            Compensation::Coarse { interval, correction } => {
-                w.set_compen_val((interval as u16) << 8 | correction as u16);
-            }
-
-            Compensation::Fine { integral, fractional } => {
-                w.set_compen_val((integral as u16) << 8 | fractional as u16);
-            }
-        });
-
-        self.enable_write_protect();
+            });
+        })
+        .map_err(|_| SetupError::RegisterAccess)?;
 
         // Selecting a clock that is not running desynchronizes the block on the
         // spot, so confirm CLK_SEL actually took the requested value. Check the
         // sentinel first: bit 9 of FFFEh is set, so a failed write of
         // ClkSel::Clk32768 would otherwise read back as success.
-        let ctrl = self.info.regs().ctrl().read();
+        let ctrl = regs.ctrl().read();
         if ctrl.0 == DESYNCED || ctrl.clk_sel() != bool::from(config.clksel) {
             return Err(SetupError::RegisterAccess);
         }
 
         Ok(())
-    }
-
-    fn disable_write_protect(&mut self) {
-        // The Write Enable (WE) state machine is STATUS bits [7:6], NOT [1:0].
-        // Unlocking requires writing WE = 0b00, 0b01, 0b11, 0b10 in sequence,
-        // i.e. full-byte values 0x00, 0x40, 0xC0, 0x80. The previous code wrote
-        // 0x00,0x01,0x03,0x02 which targets bits [1:0], leaving WE = 00 forever,
-        // so write protection was never actually cleared. Once the RTC auto-locks
-        // after the power-on grace window, register writes fault (precise BusFault).
-        //
-        // CRITICAL: the WE sequence must only be run when protection is currently
-        // ENGAGED. Replaying it from an already-unlocked state re-arms protection
-        // (observed: write_prot_en false -> true), which then faults the very next
-        // register write. Guard on write_prot_en so the no-op case (already
-        // unlocked, e.g. at POR during set_configuration) leaves the RTC writable.
-        if self.info.regs().status().read().write_prot_en() {
-            self.info.regs().status8().write_value(0x00);
-            self.info.regs().status8().write_value(0x40);
-            self.info.regs().status8().write_value(0xC0);
-            self.info.regs().status8().write_value(0x80);
-        }
-    }
-
-    fn enable_write_protect(&mut self) {
-        // Re-engage write protection with a single out-of-sequence WE write
-        // (WE = 0b10 -> full-byte 0x80). This is safe at the end of any write
-        // path because the preceding register writes have already completed; only
-        // replaying the full unlock sequence from an unlocked state is dangerous.
-        self.info.regs().status8().write_value(0x80);
     }
 
     fn is_valid_datetime(&self, t: DateTime) -> Result<(), RtcError> {
@@ -678,28 +702,25 @@ impl<'a> Rtc<'a> {
         let minute = t.minute;
         let second = t.second;
 
-        self.disable_write_protect();
+        let regs = self.info.regs();
+        with_unlocked(regs, || {
+            regs.yearmon().write(|w| {
+                w.set_yrofst(year);
+                w.set_mon_cnt(month);
+            });
 
-        self.info.regs().yearmon().write(|w| {
-            w.set_yrofst(year);
-            w.set_mon_cnt(month);
-        });
+            regs.days().write(|w| {
+                w.set_dow(dow);
+                w.set_day_cnt(day);
+            });
 
-        self.info.regs().days().write(|w| {
-            w.set_dow(dow);
-            w.set_day_cnt(day);
-        });
+            regs.hourmin().write(|w| {
+                w.set_hour_cnt(hour);
+                w.set_min_cnt(minute);
+            });
 
-        self.info.regs().hourmin().write(|w| {
-            w.set_hour_cnt(hour);
-            w.set_min_cnt(minute);
-        });
-
-        self.info.regs().seconds().write(|w| w.set_sec_cnt(second));
-
-        self.enable_write_protect();
-
-        Ok(())
+            regs.seconds().write(|w| w.set_sec_cnt(second));
+        })
     }
 
     /// Set the Daylight Savings start and end time.
@@ -717,26 +738,23 @@ impl<'a> Rtc<'a> {
         self.is_valid_dst_year(start)?;
         self.is_valid_dst_year(end)?;
 
-        self.disable_write_protect();
+        let regs = self.info.regs();
+        with_unlocked(regs, || {
+            regs.dst_hour().write(|w| {
+                w.set_dst_start_hour(start.hour - 1);
+                w.set_dst_end_hour(end.hour - 1);
+            });
 
-        self.info.regs().dst_hour().write(|w| {
-            w.set_dst_start_hour(start.hour - 1);
-            w.set_dst_end_hour(end.hour - 1);
-        });
+            regs.dst_month().write(|w| {
+                w.set_dst_start_month(start.month.into());
+                w.set_dst_end_month(end.month.into());
+            });
 
-        self.info.regs().dst_month().write(|w| {
-            w.set_dst_start_month(start.month.into());
-            w.set_dst_end_month(end.month.into());
-        });
-
-        self.info.regs().dst_day().write(|w| {
-            w.set_dst_start_day(start.day);
-            w.set_dst_end_day(end.day);
-        });
-
-        self.enable_write_protect();
-
-        Ok(())
+            regs.dst_day().write(|w| {
+                w.set_dst_start_day(start.day);
+                w.set_dst_end_day(end.day);
+            });
+        })
     }
 
     /// Program the RTC alarm and return a future that does not borrow the RTC.
@@ -760,46 +778,50 @@ impl<'a> Rtc<'a> {
         let minute = t.minute;
         let second = t.second;
 
-        self.disable_write_protect();
-
-        self.info.regs().alm_yearmon().write(|w| {
-            w.set_alm_year(year);
-            w.set_alm_mon(month);
-        });
-
-        self.info.regs().alm_days().write(|w| {
-            w.set_alm_day(day);
-        });
-
-        self.info.regs().alm_hourmin().write(|w| {
-            w.set_alm_hour(hour);
-            w.set_alm_min(minute);
-        });
-
-        self.info.regs().alm_seconds().write(|w| w.set_alm_sec(second));
-        // ALM_IS sets on every match, even with ALM_IE clear (RM 38.5.1.12), so a
-        // dropped alarm or a daily re-match leaves it set. The future would then
-        // complete at once and write ISR after write protection is re-engaged,
-        // which is a transfer error (BusFault). Clear it while unlocked, after the
-        // new alarm values are in place and before the interrupt is enabled.
-        self.info.regs().isr().write(|w| w.set_alm_is(true));
-        self.info.regs().ier().modify(|w| w.set_alm_ie(true));
-        self.enable_write_protect();
         let info = self.info;
+        let regs = info.regs();
+        with_unlocked(regs, || {
+            // Disarm first so the ISR cannot run on a half-written alarm.
+            regs.ier().modify(|w| w.set_alm_ie(false));
+
+            regs.alm_yearmon().write(|w| {
+                w.set_alm_year(year);
+                w.set_alm_mon(month);
+            });
+
+            regs.alm_days().write(|w| {
+                w.set_alm_day(day);
+            });
+
+            regs.alm_hourmin().write(|w| {
+                w.set_alm_hour(hour);
+                w.set_alm_min(minute);
+            });
+
+            regs.alm_seconds().write(|w| w.set_alm_sec(second));
+
+            // ALM_IS sets on every match, even with ALM_IE clear (RM 38.5.1.12),
+            // so a dropped alarm or a daily re-match leaves it set. Clear it, and
+            // any fired flag from an earlier alarm, after the new alarm values
+            // are in place and before the interrupt is enabled.
+            regs.isr().write(|w| w.set_alm_is(true));
+            info.alarm_fired.store(false, Ordering::Release);
+            regs.ier().modify(|w| w.set_alm_ie(true));
+        })?;
+
+        // The match fires only on the tick into the alarm second. An alarm at
+        // the current second therefore never fires, and a tick that lands
+        // between writing the alarm and clearing ALM_IS above is lost. In both
+        // cases the counter has already reached the alarm, so report it fired.
+        if self.now().is_ok_and(|now| datetime_key(now) >= datetime_key(t)) {
+            info.alarm_fired.store(true, Ordering::Release);
+        }
+
         Ok(async move {
             info.wait_cell()
-                .wait_for(|| {
-                    let isr = info.regs().isr().read();
-                    // ALM_IS is bit 2 and bit 2 of the FFFEh synchronizing
-                    // sentinel is set, so an unguarded alm_is() reports a fired
-                    // alarm the instant the block loses its clock.
-                    isr.0 != DESYNCED && isr.alm_is()
-                })
+                .wait_for(|| info.alarm_fired.swap(false, Ordering::AcqRel))
                 .await
-                .map_err(|_| RtcError::Other)?;
-            info.regs().isr().write(|w| w.set_alm_is(true));
-
-            Ok(())
+                .map_err(|_| RtcError::Other)
         })
     }
 
@@ -826,20 +848,15 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         // synchronizing sentinel first: ALM_IS is bit 2, which is set in FFFEh.
         let status = regs.isr().read();
 
-        if status.0 != DESYNCED && status.alm_is() {
-            // The RTC re-engages write protection on its own grace timer, which can
-            // elapse during the wait between arming the alarm and it firing. Clearing
-            // ALM_IE below is a protected register write, so re-run the WE unlock
-            // sequence first if protection re-armed — otherwise this faults
-            // (escalated BusFault at the IER register). The sequence must only run
-            // when actually locked; replaying it from an unlocked state re-locks.
-            if regs.status().read().write_prot_en() {
-                regs.status8().write_value(0x00);
-                regs.status8().write_value(0x40);
-                regs.status8().write_value(0xC0);
-                regs.status8().write_value(0x80);
-            }
-            regs.ier().modify(|w| w.set_alm_ie(false));
+        if status.0 != DESYNCED && status.alm_is() && regs.ier().read().alm_ie() {
+            // Acknowledge and disarm here, inside a fresh unlock window, so no
+            // later code has to write to a block that may have locked itself.
+            // On failure ALM_IS stays set and the interrupt re-enters to retry.
+            let _ = with_unlocked(regs, || {
+                regs.isr().write(|w| w.set_alm_is(true));
+                regs.ier().modify(|w| w.set_alm_ie(false));
+            });
+            T::info().alarm_fired.store(true, Ordering::Release);
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
         }

@@ -620,24 +620,29 @@ pub enum Osc32KCapSel {
     Cap30PicoF,
 }
 
-/// LP-only OSC32K configuration.
+/// OSC32K configuration: LP (default) or Normal mode.
 ///
 /// Startup loading must be qualified for the crystal and PCB parasitics; crystal C0
 /// is not the pad/PCB shunt capacitance. Readiness does not establish frequency accuracy
-/// or crystal drive compliance. Normal mode is not supported on this device family.
-/// A compatible retained LP source is adopted without replaying startup. Unrequested
+/// or crystal drive compliance.
+/// A compatible retained source is adopted without replaying startup. Unrequested
 /// retained output gates remain enabled, but are not advertised in the clock cache.
 #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
 #[non_exhaustive]
 pub struct Osc32KConfig {
-    /// XTAL pin capacitance used only during startup.
+    /// XTAL pin capacitance used during startup, and kept in Normal mode.
     pub startup_xtal_cap_sel: Osc32KCapSel,
-    /// EXTAL pin capacitance used only during startup.
+    /// EXTAL pin capacitance used during startup, and kept in Normal mode.
     pub startup_extal_cap_sel: Osc32KCapSel,
-    /// Oscillator transconductance gain used during startup and LP operation.
+    /// Oscillator transconductance gain used during startup and LP or Normal operation.
     pub coarse_amp_gain: Osc32KCoarseGain,
-    /// Select the LP supply detector setting for VBAT above 3.0 V.
+    /// Select the LP supply detector setting for VBAT above 3.0 V. Unused in Normal mode.
     pub vbat_exceeds_3v0: bool,
+    /// Run in Normal mode (`MODE_EN = 00b`, RM 31.5) instead of LP.
+    ///
+    /// Normal mode keeps the startup capacitances and supports higher crystal ESR
+    /// and load capacitance than LP, at higher current. See the datasheet.
+    pub normal_mode: bool,
     /// Maximum status polls per LDO/startup/LP readiness stage, before the time driver exists.
     ///
     /// The reference default is 100,000,000 polls, not a wall-clock duration. Tune for
@@ -661,6 +666,7 @@ impl Default for Osc32KConfig {
             startup_extal_cap_sel: Osc32KCapSel::Cap12PicoF,
             coarse_amp_gain: Osc32KCoarseGain::EsrRange1,
             vbat_exceeds_3v0: true,
+            normal_mode: false,
             readiness_poll_budget: core::num::NonZeroU32::new(100_000_000).unwrap(),
             vsys_domain_active: true,
             vdd_core_domain_active: true,

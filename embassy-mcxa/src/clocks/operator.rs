@@ -474,7 +474,7 @@ impl ClockOperator<'_> {
             if !self.osc32k_lp_controls_match() {
                 return Err(ClockError::BadConfig {
                     clock: "osc32k",
-                    reason: "retained oscillator is not compatible LP; VBAT POR required",
+                    reason: "retained oscillator does not match config; VBAT POR required",
                 });
             }
         } else if self.vbat0.osclcka().read().lock() {
@@ -506,18 +506,22 @@ impl ClockOperator<'_> {
             SupplyDet::L3vsupply
         };
         let osc = self.vbat0.oscctla().read();
-        osc.osc_en()
-            && !osc.osc_byp_en()
-            && osc.cap_sel_en()
+        let common = osc.osc_en() && !osc.osc_byp_en() && osc.cap_sel_en() && osc.coarse_amp_gain() == gain;
+        if cfg.normal_mode {
+            return common
+                && osc.mode_en() == ModeEn::Hp
+                && osc.xtal_cap_sel() == XtalCapSel::from_bits(cfg.startup_xtal_cap_sel as u8)
+                && osc.extal_cap_sel() == ExtalCapSel::from_bits(cfg.startup_extal_cap_sel as u8);
+        }
+        common
             && osc.mode_en() == ModeEn::Sw
             && osc.xtal_cap_sel() == XtalCapSel::Sel0
             && osc.extal_cap_sel() == ExtalCapSel::Sel0
-            && osc.coarse_amp_gain() == gain
             && osc.supply_det() == supply
             && self.vbat0.osccfga().read().init_trim() == InitTrim::Sel0
     }
 
-    /// Establish LP OSC32K or adopt a compatible retained source without restarting it.
+    /// Establish LP or Normal OSC32K, or adopt a compatible retained source without restarting it.
     #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     pub(super) fn configure_osc32k_clocks(&mut self) -> Result<(), ClockError> {
         use config::Osc32KCoarseGain;
@@ -564,8 +568,11 @@ impl ClockOperator<'_> {
         }
 
         if !retained {
-            // RM 31.5 / SDK 26.09 LP sequence. Preserve all factory analog trim fields.
-            self.vbat0.osccfga().modify(|w| w.set_init_trim(InitTrim::Sel3));
+            // RM 31.5 / SDK 26.09 LP sequence, or RM 31.5 Normal sequence.
+            // Preserve all factory analog trim fields.
+            if !cfg.normal_mode {
+                self.vbat0.osccfga().modify(|w| w.set_init_trim(InitTrim::Sel3));
+            }
             self.vbat0.oscctla().modify(|w| {
                 w.set_xtal_cap_sel(XtalCapSel::from_bits(cfg.startup_xtal_cap_sel as u8));
                 w.set_extal_cap_sel(ExtalCapSel::from_bits(cfg.startup_extal_cap_sel as u8));
@@ -576,8 +583,8 @@ impl ClockOperator<'_> {
                     Osc32KCoarseGain::EsrRange3 => CoarseAmpGain::Gain33,
                 });
                 w.set_osc_byp_en(false);
-                // PAC names: Lp = startup (01), Sw = final LP (11), not Normal (00).
-                w.set_mode_en(ModeEn::Lp);
+                // PAC names: Hp = Normal (00), Lp = startup (01), Sw = final LP (11).
+                w.set_mode_en(if cfg.normal_mode { ModeEn::Hp } else { ModeEn::Lp });
                 w.set_cap_sel_en(true);
                 w.set_osc_en(true);
             });
@@ -592,18 +599,20 @@ impl ClockOperator<'_> {
                 }
             }
 
-            // Encoding 0 is an 8-second initialization trim, not a disabled timer.
-            self.vbat0.osccfga().modify(|w| w.set_init_trim(InitTrim::Sel0));
-            self.vbat0.oscctla().modify(|w| {
-                w.set_mode_en(ModeEn::Sw);
-                w.set_xtal_cap_sel(XtalCapSel::Sel0);
-                w.set_extal_cap_sel(ExtalCapSel::Sel0);
-                w.set_supply_det(if cfg.vbat_exceeds_3v0 {
-                    SupplyDet::G3vsupply
-                } else {
-                    SupplyDet::L3vsupply
+            if !cfg.normal_mode {
+                // Encoding 0 is an 8-second initialization trim, not a disabled timer.
+                self.vbat0.osccfga().modify(|w| w.set_init_trim(InitTrim::Sel0));
+                self.vbat0.oscctla().modify(|w| {
+                    w.set_mode_en(ModeEn::Sw);
+                    w.set_xtal_cap_sel(XtalCapSel::Sel0);
+                    w.set_extal_cap_sel(ExtalCapSel::Sel0);
+                    w.set_supply_det(if cfg.vbat_exceeds_3v0 {
+                        SupplyDet::G3vsupply
+                    } else {
+                        SupplyDet::L3vsupply
+                    });
                 });
-            });
+            }
         }
 
         let mut remaining = cfg.readiness_poll_budget.get();

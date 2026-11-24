@@ -510,9 +510,10 @@ impl ClockOperator<'_> {
 
     /// Establish LP or Normal OSC32K, or adopt a compatible retained source without restarting it.
     ///
-    /// A retained oscillator with other settings is restarted when unlocked. When
-    /// locked it cannot change: it is kept (or, if disabled, left without outputs)
-    /// and reported through `Clocks::osc32k_status` instead of failing.
+    /// OSC32K is not locked. A retained oscillator with other settings is restarted
+    /// when unlocked. When locked (by older firmware) it cannot change: it is kept
+    /// (or, if disabled, left without outputs) and reported through
+    /// `Clocks::osc32k_status` instead of failing.
     #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     pub(super) fn configure_osc32k_clocks(&mut self) -> Result<(), ClockError> {
         use config::Osc32KCoarseGain;
@@ -665,10 +666,10 @@ impl ClockOperator<'_> {
             });
         }
 
-        // Write-once locks clear only on VBAT POR. Lock only after successful readback.
+        // The LDO lock is write-once until VBAT POR. Lock only after successful readback.
         // Failures deliberately leave supplies/source running, without rollback or cache publication.
+        // OSC32K is left unlocked, so a later image can change its settings without a VBAT POR.
         self.vbat0.ldolcka().modify(|w| w.set_lock(true));
-        self.vbat0.osclcka().modify(|w| w.set_lock(true));
         const ENABLED: Option<Clock> = Some(Clock {
             frequency: 32_768,
             power: PoweredClock::AlwaysEnabled,

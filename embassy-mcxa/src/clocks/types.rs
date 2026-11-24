@@ -183,9 +183,9 @@ pub struct Clocks {
 
 /// Outcome of `OSC32K` setup against the oscillator retained in the VBAT domain.
 ///
-/// VBAT controls survive every reset except a VBAT POR, and a lock bit makes them
-/// read-only until then. A retained oscillator with other settings cannot always be
-/// changed, so setup reports what it did instead of failing.
+/// VBAT controls survive every reset except a VBAT POR. This HAL does not set the
+/// oscillator lock, but older firmware may have; a locked oscillator stays read-only
+/// until a VBAT POR. Setup reports what it did instead of failing.
 #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

@@ -627,6 +627,7 @@ pub enum Osc32KCapSel {
 /// or crystal drive compliance.
 /// A compatible retained source is adopted without replaying startup. Unrequested
 /// retained output gates remain enabled, but are not advertised in the clock cache.
+/// The oscillator is not locked (`OSCLCKA`), so later configurations can change it.
 #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
 #[non_exhaustive]
 pub struct Osc32KConfig {

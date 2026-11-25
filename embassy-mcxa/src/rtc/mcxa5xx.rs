@@ -8,7 +8,7 @@ use embassy_hal_internal::{Peri, PeripheralType};
 use embedded_mcu_hal::time::{Datetime, DatetimeClock, DatetimeClockError, DatetimeFields, Month as HalMonth};
 use maitake_sync::WaitCell;
 
-use crate::clocks::{WakeGuard, with_clocks};
+use crate::clocks::{Clock, WakeGuard, with_clocks};
 use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::pac;
 use crate::pac::rtc::Swr;
@@ -47,15 +47,20 @@ impl Info {
         &self.wait_cell
     }
 
-    fn disable_write_protect(&self) {
+    fn disable_write_protect(&self) -> bool {
         // The Write Enable state machine is STATUS[7:6]. Only run the unlock
         // sequence when locked: replaying it while unlocked re-arms protection.
-        if self.regs().status().read().write_prot_en() {
+        // Re-run it until it takes (RM 38.3.7 Note 1): after Stop exit, STATUS
+        // reads FFFEh and writes are ignored until resync (RM 38.3.1.2).
+        let mut tries = 1_000_000u32;
+        while self.regs().status().read().write_prot_en() && tries > 0 {
             self.regs().status8().write_value(0x00);
             self.regs().status8().write_value(0x40);
             self.regs().status8().write_value(0xC0);
             self.regs().status8().write_value(0x80);
+            tries -= 1;
         }
+        !self.regs().status().read().write_prot_en()
     }
 
     fn enable_write_protect(&self) {
@@ -385,7 +390,7 @@ const DESYNCED: u16 = 0xfffe;
 ///
 /// This is a distinct sentinel from [`DESYNCED`]: FFFFh means the counters are
 /// mid-update and the read should simply be retried, whereas FFFEh means the
-/// block has no clock at all and retrying will never succeed.
+/// register interface is synchronizing, possibly because its clock is stopped.
 const INVALID: u16 = 0xffff;
 
 /// Errors exclusive to HW initialization
@@ -409,6 +414,8 @@ pub enum RtcError {
     InvalidDateTime,
     /// Invalid DST year
     InvalidDstYear,
+    /// Write protection could not be disabled
+    WriteProtected,
     /// Other error
     Other,
 }
@@ -454,7 +461,29 @@ pub struct Rtc<'a> {
 impl<'a> Rtc<'a> {
     const BASE_YEAR: i16 = 2112;
 
+    fn selected_clock(clksel: ClkSel) -> Result<Clock, SetupError> {
+        // RTC uses the VBAT-domain outputs, not the system/core outputs.
+        // A retained but unadvertised source is not an initialization opt-in.
+        with_clocks(|c| match clksel {
+            ClkSel::Clk16384 => c.clk_16k_vbat.clone(),
+            ClkSel::Clk32768 => {
+                #[cfg(not(feature = "rosc-32k-as-gpio"))]
+                {
+                    c.clk_32k_vbat.clone()
+                }
+                #[cfg(feature = "rosc-32k-as-gpio")]
+                None
+            }
+        })
+        .flatten()
+        .ok_or(SetupError::ClockSetup)
+    }
+
     /// Create an exclusive RTC handle and a cloneable, read-only time provider.
+    ///
+    /// Board clock setup must enable both the currently selected (possibly
+    /// retained) source and the requested source. This does not start oscillators;
+    /// it waits finitely for register synchronization before configuration.
     pub fn new<T: Instance>(
         _inst: Peri<'a, T>,
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
@@ -470,13 +499,7 @@ impl<'a> Rtc<'a> {
         // osc32k[2] (RM p.81527), not the system-domain [0] outputs. Measured
         // on FRDM-MCXA577 with CLK_SEL=0: the counter runs with FROCLKE=0b100
         // alone, and stops with 0b001 or 0b010.
-        let clocks = if config.clksel == ClkSel::Clk16384 {
-            with_clocks(|c| c.clk_16k_vbat.clone())
-        } else {
-            with_clocks(|c| c.clk_32k_vbat.clone())
-        };
-
-        let clk = clocks.flatten().ok_or(SetupError::ClockSetup)?;
+        let clk = Self::selected_clock(config.clksel)?;
 
         let mut inst = Self {
             info,
@@ -501,7 +524,26 @@ impl<'a> Rtc<'a> {
     }
 
     fn set_configuration(&mut self, config: &Config) -> Result<(), SetupError> {
-        critical_section::with(|_| self.set_configuration_inner(config))
+        let clk = Self::selected_clock(config.clksel)?;
+        let wg = WakeGuard::for_power(&clk.power);
+
+        // RM 38.3.1.2-3: FFFEh is normal for two oscillator cycles after the
+        // selected clock becomes available. Wait outside the protected-write
+        // critical section; a stopped source must still fail finitely. This is
+        // a CPU/bus-dependent poll budget, not a wall-clock timeout.
+        let mut polls = 1_000_000u32;
+        while self.info.regs().ctrl().read().0 == DESYNCED {
+            if polls == 0 {
+                return Err(SetupError::RegisterAccess);
+            }
+            polls -= 1;
+            core::hint::spin_loop();
+        }
+
+        critical_section::with(|_| self.set_configuration_inner(config))?;
+        self._freq = clk.frequency;
+        self._wg = wg;
+        Ok(())
     }
 
     fn set_configuration_inner(&mut self, config: &Config) -> Result<(), SetupError> {
@@ -512,7 +554,34 @@ impl<'a> Rtc<'a> {
             return Err(SetupError::RegisterAccess);
         }
 
-        self.disable_write_protect();
+        // The block may still be in its power-on unlocked window, whose age is
+        // unknown. Lock first so configuration gets a fresh two-second window
+        // rather than racing the inherited window's expiry (RM 38.3.7).
+        let mut attempts = 8u8;
+        loop {
+            if attempts == 0 {
+                return Err(SetupError::RegisterAccess);
+            }
+            attempts -= 1;
+
+            self.enable_write_protect();
+            let status = self.info.regs().status().read();
+            if status.0 == DESYNCED {
+                return Err(SetupError::RegisterAccess);
+            }
+            if !status.write_prot_en() {
+                continue;
+            }
+
+            self.disable_write_protect();
+            let status = self.info.regs().status().read();
+            if status.0 == DESYNCED {
+                return Err(SetupError::RegisterAccess);
+            }
+            if !status.write_prot_en() {
+                break;
+            }
+        }
 
         self.info.regs().ctrl().modify(|w| w.set_swr(Swr::Asserted));
         self.info.regs().ctrl().modify(|w| w.set_swr(Swr::Cleared));
@@ -556,6 +625,11 @@ impl<'a> Rtc<'a> {
 
         self.enable_write_protect();
 
+        let status = self.info.regs().status().read();
+        if status.0 == DESYNCED || !status.write_prot_en() {
+            return Err(SetupError::RegisterAccess);
+        }
+
         // Selecting a clock that is not running desynchronizes the block on the
         // spot, so confirm CLK_SEL actually took the requested value. Check the
         // sentinel first: bit 9 of FFFEh is set, so a failed write of
@@ -568,8 +642,8 @@ impl<'a> Rtc<'a> {
         Ok(())
     }
 
-    fn disable_write_protect(&mut self) {
-        self.info.disable_write_protect();
+    fn disable_write_protect(&mut self) -> bool {
+        self.info.disable_write_protect()
     }
 
     fn enable_write_protect(&mut self) {
@@ -620,6 +694,10 @@ impl<'a> Rtc<'a> {
     /// # Errors
     ///
     /// Will return `RtcError::InvalidDateTime` if the datetime is not a valid range.
+    /// Returns `RtcError::Other` if the counters are inaccessible or the update
+    /// cannot be verified. An unsuccessful update may have changed some fields;
+    /// the caller can retry setting the complete datetime.
+    /// Returns `RtcError::WriteProtected` if write protection could not be disabled, and nothing was written.
     pub fn set_datetime(&mut self, t: DateTime) -> Result<(), RtcError> {
         Self::is_valid_datetime(t)?;
 
@@ -631,10 +709,33 @@ impl<'a> Rtc<'a> {
         let minute = t.minute;
         let second = t.second;
 
+        // RM 38.5.1.11: calendar writes during INVAL_BIT terminate normally but
+        // do not update the counters. Wait outside the critical section, bounded
+        // as in read_datetime so a stopped clock cannot hang the caller.
+        let mut spins = 1_000_000u32;
+        loop {
+            let status = self.info.regs().status().read();
+            if status.0 != DESYNCED && !status.inval_bit() {
+                break;
+            }
+            if spins == 0 {
+                return Err(RtcError::Other);
+            }
+            spins -= 1;
+            core::hint::spin_loop();
+        }
+
         // A time provider may read from another interrupt context. Serialize the
         // complete calendar update with its snapshot, not each register alone.
         critical_section::with(|_| {
-            self.disable_write_protect();
+            let status = self.info.regs().status().read();
+            if status.0 == DESYNCED || status.inval_bit() {
+                return Err(RtcError::Other);
+            }
+
+            if !self.disable_write_protect() {
+                return Err(RtcError::WriteProtected);
+            }
 
             self.info.regs().yearmon().write(|w| {
                 w.set_yrofst(year);
@@ -654,9 +755,30 @@ impl<'a> Rtc<'a> {
             self.info.regs().seconds().write(|w| w.set_sec_cnt(second));
 
             self.enable_write_protect();
-        });
 
-        Ok(())
+            // A hardware counter update can still overlap the writes despite
+            // interrupt masking. INVAL_BIT may already have cleared again, so
+            // verify every field rather than trusting its final state alone.
+            let s = self.info.regs().seconds().read();
+            let hm = self.info.regs().hourmin().read();
+            let d = self.info.regs().days().read();
+            let ym = self.info.regs().yearmon().read();
+            let status = self.info.regs().status().read();
+            if status.0 == DESYNCED
+                || status.inval_bit()
+                || s.sec_cnt() != second
+                || hm.hour_cnt() != hour
+                || hm.min_cnt() != minute
+                || d.dow() != dow
+                || d.day_cnt() != day
+                || ym.yrofst() != year
+                || ym.mon_cnt() != month
+            {
+                return Err(RtcError::Other);
+            }
+
+            Ok(())
+        })
     }
 
     /// Set the Daylight Savings start and end time.
@@ -675,7 +797,9 @@ impl<'a> Rtc<'a> {
         self.is_valid_dst_year(end)?;
 
         critical_section::with(|_| {
-            self.disable_write_protect();
+            if !self.disable_write_protect() {
+                return Err(RtcError::WriteProtected);
+            }
 
             self.info.regs().dst_hour().write(|w| {
                 w.set_dst_start_hour(start.hour - 1);
@@ -693,9 +817,8 @@ impl<'a> Rtc<'a> {
             });
 
             self.enable_write_protect();
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Set alarm to `t` and wait for the RTC alarm interrupt to trigger.
@@ -714,10 +837,11 @@ impl<'a> Rtc<'a> {
         let info = self.info;
         let _cleanup = DropGuard::new(info, |info| {
             critical_section::with(|_| {
-                info.disable_write_protect();
-                info.regs().ier().modify(|w| w.set_alm_ie(false));
-                info.regs().isr().write(|w| w.set_alm_is(true));
-                info.enable_write_protect();
+                if info.disable_write_protect() {
+                    info.regs().ier().modify(|w| w.set_alm_ie(false));
+                    info.regs().isr().write(|w| w.set_alm_is(true));
+                    info.enable_write_protect();
+                }
             });
         });
 
@@ -729,7 +853,9 @@ impl<'a> Rtc<'a> {
         let second = t.second;
 
         critical_section::with(|_| {
-            self.disable_write_protect();
+            if !self.disable_write_protect() {
+                return Err(RtcError::WriteProtected);
+            }
             self.info.regs().ier().modify(|w| w.set_alm_ie(false));
 
             self.info.regs().alm_yearmon().write(|w| {
@@ -752,7 +878,8 @@ impl<'a> Rtc<'a> {
             self.info.regs().isr().write(|w| w.set_alm_is(true));
             self.info.regs().ier().modify(|w| w.set_alm_ie(true));
             self.enable_write_protect();
-        });
+            Ok(())
+        })?;
 
         info.wait_cell()
             .wait_for(|| {
@@ -788,7 +915,7 @@ fn read_datetime(info: &Info) -> Result<DateTime, RtcError> {
         // Bounded so an RTC with no running clock reports an error instead
         // of hanging the caller.
         let mut spins = 0u32;
-        while info.regs().status().read().inval_bit() {
+        while matches!(info.regs().status().read(), s if s.0 == DESYNCED || s.inval_bit()) {
             spins += 1;
             if spins > 1_000_000 {
                 return Err(RtcError::Other);
@@ -864,9 +991,10 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
             if status.0 != DESYNCED && status.alm_is() {
                 // Protection can re-engage during a wait. Only replay the unlock
                 // sequence when locked; replaying it while unlocked re-locks.
-                info.disable_write_protect();
-                regs.ier().modify(|w| w.set_alm_ie(false));
-                info.enable_write_protect();
+                if info.disable_write_protect() {
+                    regs.ier().modify(|w| w.set_alm_ie(false));
+                    info.enable_write_protect();
+                }
                 true
             } else {
                 false
